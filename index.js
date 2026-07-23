@@ -206,8 +206,8 @@ const getTreeRootPids = (input, processes, ignoreCase) => {
 
 	return processes
 		.filter(process_ => {
-			const name = ignoreCase ? process_.name.toLowerCase() : process_.name;
-			return name === normalizedInput;
+			const names = [process_.name, process_.cmd?.split(' ')[0]].filter(Boolean);
+			return names.some(name => (ignoreCase ? name.toLowerCase() : name) === normalizedInput);
 		})
 		.map(process_ => process_.pid);
 };
@@ -233,16 +233,17 @@ const getDescendantPidsForRoots = async (rootPids, protectedPids) => {
 		.reverse();
 };
 
-const getDescendantPids = async (input, options) => {
+const getProcessTreePids = async (input, options) => {
 	if (process.platform === 'win32' || options.tree === false) {
-		return [];
+		return {rootPids: [], descendantPids: []};
 	}
 
 	const processes = await psList();
 	const protectedPids = new Set(getCurrentProcessParentsPID(processes));
 	const rootPids = getTreeRootPids(input, processes, options.ignoreCase);
+	const descendantPids = await getDescendantPidsForRoots(rootPids, protectedPids);
 
-	return getDescendantPidsForRoots(rootPids, protectedPids);
+	return {rootPids, descendantPids};
 };
 
 const killIfStillRunning = async (pid, options) => {
@@ -257,13 +258,15 @@ const killIfStillRunning = async (pid, options) => {
 };
 
 const killDescendants = async (input, options) => {
-	const descendantPids = await getDescendantPids(input, options);
+	const {rootPids, descendantPids} = await getProcessTreePids(input, options);
 
 	for (const pid of descendantPids) {
 		await killIfStillRunning(pid, options); // eslint-disable-line no-await-in-loop
 	}
 
-	return descendantPids;
+	// Tracking concrete root PIDs matters for name-based kills: once signalled,
+	// the process name can disappear before the process has actually exited.
+	return [...descendantPids, ...rootPids];
 };
 
 const waitForProcessExit = async (parsedInputsMap, timeout, silent) => {
