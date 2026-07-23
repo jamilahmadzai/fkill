@@ -3,6 +3,7 @@ import path from 'node:path';
 import {taskkill} from 'taskkill';
 import {execa} from 'execa';
 import {portToPid} from 'pid-port';
+import pidtree from 'pidtree';
 import {processExistsMultiple, filterExistingProcesses} from 'process-exists';
 import psList from 'ps-list';
 
@@ -196,6 +197,75 @@ const getCurrentProcessParentsPID = processes => {
 	return pids;
 };
 
+const getTreeRootPids = (input, processes, ignoreCase) => {
+	if (typeof input === 'number') {
+		return input > 0 ? [input] : [];
+	}
+
+	const normalizedInput = ignoreCase ? input.toLowerCase() : input;
+
+	return processes
+		.filter(process_ => {
+			const name = ignoreCase ? process_.name.toLowerCase() : process_.name;
+			return name === normalizedInput;
+		})
+		.map(process_ => process_.pid);
+};
+
+const getDescendantPidsForRoots = async (rootPids, protectedPids) => {
+	const descendantPidLists = await Promise.all(rootPids.map(async rootPid => {
+		try {
+			return await pidtree(rootPid);
+		} catch (error) {
+			const alive = await filterExistingProcesses([rootPid]);
+			if (alive.length === 0) {
+				return [];
+			}
+
+			throw error;
+		}
+	}));
+
+	// Pidtree returns breadth-first results. Reverse the de-duplicated list so
+	// grandchildren are signalled before their parents.
+	return [...new Set(descendantPidLists.flat())]
+		.filter(pid => !protectedPids.has(pid))
+		.reverse();
+};
+
+const getDescendantPids = async (input, options) => {
+	if (process.platform === 'win32' || options.tree === false) {
+		return [];
+	}
+
+	const processes = await psList();
+	const protectedPids = new Set(getCurrentProcessParentsPID(processes));
+	const rootPids = getTreeRootPids(input, processes, options.ignoreCase);
+
+	return getDescendantPidsForRoots(rootPids, protectedPids);
+};
+
+const killIfStillRunning = async (pid, options) => {
+	try {
+		await kill(pid, options);
+	} catch (error) {
+		const alive = await filterExistingProcesses([pid]);
+		if (alive.length > 0) {
+			throw error;
+		}
+	}
+};
+
+const killDescendants = async (input, options) => {
+	const descendantPids = await getDescendantPids(input, options);
+
+	for (const pid of descendantPids) {
+		await killIfStillRunning(pid, options); // eslint-disable-line no-await-in-loop
+	}
+
+	return descendantPids;
+};
+
 const waitForProcessExit = async (parsedInputsMap, timeout, silent) => {
 	const endTime = Date.now() + timeout;
 	let interval = ALIVE_CHECK_MIN_INTERVAL;
@@ -232,21 +302,30 @@ const killWithLimits = async (input, options) => {
 	input = await parseInput(input);
 
 	if (input === process.pid) {
-		return;
+		return [];
 	}
 
 	if (input === 'node' || input === 'node.exe') {
 		const processes = await psList();
 		const pids = getCurrentProcessParentsPID(processes);
-		await Promise.all(processes.map(async ps => {
-			if ((ps.name === 'node' || ps.name === 'node.exe') && !pids.includes(ps.pid)) {
-				await kill(ps.pid, options);
-			}
-		}));
-		return;
+		const targets = processes
+			.filter(ps => (ps.name === 'node' || ps.name === 'node.exe') && !pids.includes(ps.pid))
+			.map(ps => ps.pid);
+		const descendantPids = options.tree === false || process.platform === 'win32'
+			? []
+			: await getDescendantPidsForRoots(targets, new Set(pids));
+
+		for (const pid of [...descendantPids, ...targets]) {
+			await killIfStillRunning(pid, options); // eslint-disable-line no-await-in-loop
+		}
+
+		return [...descendantPids, ...targets];
 	}
 
+	const descendantPids = await killDescendants(input, options);
 	await kill(input, options);
+
+	return descendantPids;
 };
 
 export default async function fkill(inputs, options = {}) {
@@ -265,12 +344,16 @@ export default async function fkill(inputs, options = {}) {
 	const exists = await processExistsMultiple([...parsedInputsMap.values()]);
 
 	const errors = [];
+	const descendantPids = new Set();
 
 	const handleKill = async input => {
 		const parsedInput = parsedInputsMap.get(input);
 
 		try {
-			await killWithLimits(input, options);
+			const killedDescendantPids = await killWithLimits(input, options);
+			for (const pid of killedDescendantPids) {
+				descendantPids.add(pid);
+			}
 		} catch (error) {
 			if (!exists.get(parsedInput)) {
 				errors.push(`Killing process ${input} failed: Process doesn't exist`);
@@ -287,6 +370,11 @@ export default async function fkill(inputs, options = {}) {
 		throw new AggregateError(errors, 'Failed to kill processes');
 	}
 
+	const trackedInputsMap = new Map(parsedInputsMap);
+	for (const pid of descendantPids) {
+		trackedInputsMap.set(pid, pid);
+	}
+
 	if (options.forceAfterTimeout !== undefined && !options.force) {
 		const endTime = Date.now() + options.forceAfterTimeout;
 		let interval = ALIVE_CHECK_MIN_INTERVAL;
@@ -294,7 +382,7 @@ export default async function fkill(inputs, options = {}) {
 			interval = options.forceAfterTimeout;
 		}
 
-		let alive = [...parsedInputsMap.values()];
+		let alive = [...trackedInputsMap.values()];
 
 		do {
 			await delay(interval); // eslint-disable-line no-await-in-loop
@@ -320,6 +408,6 @@ export default async function fkill(inputs, options = {}) {
 	}
 
 	if (options.waitForExit !== undefined && options.waitForExit > 0) {
-		await waitForProcessExit(parsedInputsMap, options.waitForExit, options.silent);
+		await waitForProcessExit(trackedInputsMap, options.waitForExit, options.silent);
 	}
 }

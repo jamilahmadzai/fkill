@@ -46,6 +46,7 @@
 	"dependencies": {
 		"execa": "^9.6.0",
 		"pid-port": "^2.0.0",
+		"pidtree": "^1.0.0",
 		"process-exists": "^5.0.0",
 		"ps-list": "^9.0.0",
 		"taskkill": "^5.0.0"

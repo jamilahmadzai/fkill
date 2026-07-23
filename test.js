@@ -20,14 +20,60 @@ async function noopProcessKilled(pid) {
 
 async function waitForReady(pid) {
 	const readyFile = path.join(os.tmpdir(), `fkill-ready-${pid}`);
+	await waitForFile(readyFile, `Process ${pid} did not become ready`);
+}
+
+async function waitForFile(filePath, message = 'File was not created') {
 	const timeout = 2000;
 	const start = Date.now();
-	while (!fs.existsSync(readyFile)) {
+	while (!fs.existsSync(filePath)) {
 		if (Date.now() - start > timeout) {
-			throw new Error(`Process ${pid} did not become ready within ${timeout}ms`);
+			throw new Error(`${message} within ${timeout}ms`);
 		}
 
 		await delay(10); // eslint-disable-line no-await-in-loop
+	}
+}
+
+async function spawnProcessTree({title = '', ignoreSigterm = ''} = {}) {
+	const pidsFile = path.join(os.tmpdir(), `fkill-tree-${process.pid}-${Date.now()}-${Math.random()}`);
+	const parent = childProcess.spawn(process.execPath, [
+		'fixture-tree.js',
+		pidsFile,
+		'2',
+		title,
+		ignoreSigterm,
+	], {
+		stdio: 'ignore',
+	});
+
+	await waitForFile(`${pidsFile}.ready`, `Process tree ${parent.pid} did not become ready`);
+
+	const pids = fs.readFileSync(pidsFile, 'utf8')
+		.trim()
+		.split('\n')
+		.map(Number);
+
+	assert.strictEqual(pids.length, 3);
+	assert.strictEqual(pids[0], parent.pid);
+
+	return {parent, pids, pidsFile};
+}
+
+async function cleanupProcessTree({pids, pidsFile}) {
+	for (const pid of [...pids].reverse()) {
+		await fkill(pid, {force: true, tree: false, silent: true}); // eslint-disable-line no-await-in-loop
+	}
+
+	fs.rmSync(pidsFile, {force: true});
+	fs.rmSync(`${pidsFile}.ready`, {force: true});
+}
+
+async function assertProcessesExited(pids) {
+	await delay(100);
+
+	for (const pid of pids) {
+		assert.strictEqual(await processExists(pid), false); // eslint-disable-line no-await-in-loop
 	}
 }
 
@@ -154,6 +200,47 @@ test('kill from port', async () => {
 	await fkill(pid, {force: true});
 	await noopProcessKilled(pid);
 });
+
+test('kill process tree by default', async t => {
+	const tree = await spawnProcessTree();
+	t.after(async () => cleanupProcessTree(tree));
+
+	await fkill(tree.parent.pid, {force: true, waitForExit: 2000});
+
+	await assertProcessesExited(tree.pids);
+});
+
+test('tree: false only kills the parent process', async t => {
+	const tree = await spawnProcessTree();
+	t.after(async () => cleanupProcessTree(tree));
+
+	await fkill(tree.parent.pid, {force: true, tree: false, waitForExit: 2000});
+
+	assert.strictEqual(await processExists(tree.pids[0]), false);
+	assert.strictEqual(await processExists(tree.pids[1]), true);
+	assert.strictEqual(await processExists(tree.pids[2]), true);
+});
+
+if (process.platform !== 'win32') {
+	test('kill process tree by name', async t => {
+		const title = `fk-tree-${process.pid}`.slice(0, 15);
+		const tree = await spawnProcessTree({title});
+		t.after(async () => cleanupProcessTree(tree));
+
+		await fkill(title, {force: true, waitForExit: 2000});
+
+		await assertProcessesExited(tree.pids);
+	});
+
+	test('forceAfterTimeout kills reparented descendants', async t => {
+		const tree = await spawnProcessTree({ignoreSigterm: 'descendants'});
+		t.after(async () => cleanupProcessTree(tree));
+
+		await fkill(tree.parent.pid, {forceAfterTimeout: 100, waitForExit: 2000});
+
+		await assertProcessesExited(tree.pids);
+	});
+}
 
 // Issue #65: Verify error reporting for port syntax. These tests don't cover the full bug scenario
 // (port with process but kill fails) due to portToPid test unreliability, but the fix is sound.
